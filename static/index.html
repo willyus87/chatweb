@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Chat</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
 <style>
   :root{
     --navy-900:#14213D; --navy-800:#1B2A4A; --navy-700:#233A63;
@@ -204,7 +205,8 @@
           <div class="name" id="chat-name"></div>
           <div class="status" id="chat-status"></div>
         </div>
-        <button id="delete-convo-btn" title="Borrar conversación" style="margin-left:auto;background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:16px;">🗑</button>
+        <button id="delete-convo-btn" title="Borrar historial" style="margin-left:auto;background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:16px;">🗑</button>
+        <button id="delete-group-btn" title="Eliminar grupo" style="display:none;background:none;border:none;color:var(--red);cursor:pointer;font-size:16px;">❌</button>
         <button id="call-btn" title="Videollamada" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:16px;">📹</button>
       </div>
       <div class="messages" id="messages"></div>
@@ -226,6 +228,7 @@
     <div class="big-avatar" id="card-avatar"></div>
     <div class="card-name" id="card-name"></div>
     <div class="card-status" id="card-status"></div>
+    <button id="card-delete-contact-btn" style="background:none;color:var(--red);text-decoration:underline;display:none;margin-bottom:10px;">Eliminar contacto</button>
     <button id="card-close-btn">Cerrar</button>
   </div>
 </div>
@@ -416,6 +419,7 @@ function connect(){
 }
 
 let roster = [];
+let hiddenContacts = new Set();
 
 function handleServerMessage(data){
   if (["call_offer","call_answer","call_ice","call_end","call_reject","call_unavailable"].includes(data.type)){
@@ -431,10 +435,13 @@ function handleServerMessage(data){
     }
     renderContacts();
   }
+  else if (data.type === "hidden_contacts"){
+    hiddenContacts = new Set(data.hidden);
+  }
   else if (data.type === "presence"){
     const u = roster.find(r => r.username === data.username);
     if (u) u.status = data.status;
-    else if (data.username !== me) roster.push({username: data.username, status: data.status, avatar_url: null});
+    else if (data.username !== me && !hiddenContacts.has(data.username)) roster.push({username: data.username, status: data.status, avatar_url: null});
     renderContacts();
   }
   else if (data.type === "avatar_updated"){
@@ -463,6 +470,17 @@ function handleServerMessage(data){
     if (currentGroupId === data.group_id){
       $("messages").innerHTML = "";
     }
+  }
+  else if (data.type === "group_deleted"){
+    groups = groups.filter(g => g.id !== data.group_id);
+    delete groupUnreadCounts[data.group_id];
+    if (currentGroupId === data.group_id){
+      currentGroupId = null;
+      $("chat-view").style.display = "none";
+      $("no-chat").style.display = "flex";
+      $("app").classList.remove("chat-open");
+    }
+    renderGroups();
   }
   else if (data.type === "group_history"){
     if (data.group_id === currentGroupId){
@@ -575,6 +593,7 @@ function openChat(username){
   $("no-chat").style.display = "none";
   $("chat-view").style.display = "flex";
   $("call-btn").style.display = "inline-block";
+  $("delete-group-btn").style.display = "none";
   const u = roster.find(r => r.username === username);
   $("chat-avatar").innerHTML = avatarInnerHtml(username, u ? u.avatar_url : null);
   $("chat-avatar").style.cursor = "pointer";
@@ -615,6 +634,7 @@ function openGroup(groupId){
   $("no-chat").style.display = "none";
   $("chat-view").style.display = "flex";
   $("call-btn").style.display = "none";
+  $("delete-group-btn").style.display = (g.created_by === me) ? "inline-block" : "none";
   $("chat-avatar").innerHTML = "👥";
   $("chat-avatar").style.cursor = "default";
   $("chat-avatar").onclick = null;
@@ -728,6 +748,29 @@ $("delete-convo-btn").onclick = async () => {
   }
 };
 
+$("delete-group-btn").onclick = async () => {
+  if (!currentGroupId) return;
+  const g = groups.find(gr => gr.id === currentGroupId);
+  const ok = confirm(`¿Eliminar el grupo "${g ? g.name : ""}" para todos sus miembros? Esta acción no se puede deshacer.`);
+  if (!ok) return;
+  const res = await fetch("/api/groups/delete", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({token: myToken, group_id: currentGroupId}),
+  });
+  const data = await res.json();
+  if (res.ok){
+    groups = groups.filter(gr => gr.id !== currentGroupId);
+    currentGroupId = null;
+    $("chat-view").style.display = "none";
+    $("no-chat").style.display = "flex";
+    $("app").classList.remove("chat-open");
+    renderGroups();
+  } else {
+    alert(data.detail || "No se pudo eliminar el grupo.");
+  }
+};
+
 // ---------- Tarjeta de contacto ----------
 function showContactCard(username){
   const u = roster.find(r => r.username === username);
@@ -744,12 +787,36 @@ function showContactCard(username){
   } else {
     statusEl.textContent = "";
   }
+  $("card-delete-contact-btn").style.display = isMe ? "none" : "inline-block";
+  $("card-delete-contact-btn").onclick = () => deleteContact(username);
   $("contact-card-overlay").classList.add("visible");
 }
 $("card-close-btn").onclick = () => $("contact-card-overlay").classList.remove("visible");
 $("contact-card-overlay").onclick = (e) => {
   if (e.target.id === "contact-card-overlay") $("contact-card-overlay").classList.remove("visible");
 };
+
+async function deleteContact(username){
+  const ok = confirm(`¿Eliminar a ${username} de tu lista de contactos? Si te vuelve a escribir, va a reaparecer.`);
+  if (!ok) return;
+  const res = await fetch("/api/contacts/delete", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({token: myToken, username}),
+  });
+  const data = await res.json();
+  if (res.ok){
+    $("contact-card-overlay").classList.remove("visible");
+    if (currentChat === username){
+      currentChat = null;
+      $("chat-view").style.display = "none";
+      $("no-chat").style.display = "flex";
+      $("app").classList.remove("chat-open");
+    }
+  } else {
+    alert(data.detail || "No se pudo eliminar el contacto.");
+  }
+}
 
 // ---------- Mensajes ----------
 function ticksHtml(status){
