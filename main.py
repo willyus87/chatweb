@@ -41,6 +41,7 @@ MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB por archivo
 
 app = FastAPI()
 app.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
+app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 
 # ---------- Protección básica contra floods ----------
@@ -117,6 +118,13 @@ def init_db():
             group_id INTEGER NOT NULL,
             username TEXT NOT NULL,
             PRIMARY KEY (group_id, username)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS hidden_contacts (
+            username TEXT NOT NULL,
+            hidden_username TEXT NOT NULL,
+            PRIMARY KEY (username, hidden_username)
         )
     """)
     # Migraciones: columnas agregadas en versiones posteriores a la tabla original
@@ -278,7 +286,7 @@ def create_group(name: str, creator: str, members: list) -> dict:
         )
     conn.commit()
     conn.close()
-    return {"id": group_id, "name": name, "members": sorted(all_members)}
+    return {"id": group_id, "name": name, "members": sorted(all_members), "created_by": creator}
 
 
 def get_group_members(group_id: int):
@@ -299,6 +307,22 @@ def is_group_member(group_id: int, username: str) -> bool:
     return row is not None
 
 
+def get_group_creator(group_id: int):
+    conn = get_db()
+    row = conn.execute("SELECT created_by FROM groups WHERE id=?", (group_id,)).fetchone()
+    conn.close()
+    return row["created_by"] if row else None
+
+
+def delete_group(group_id: int):
+    conn = get_db()
+    conn.execute("DELETE FROM messages WHERE group_id=?", (group_id,))
+    conn.execute("DELETE FROM group_members WHERE group_id=?", (group_id,))
+    conn.execute("DELETE FROM groups WHERE id=?", (group_id,))
+    conn.commit()
+    conn.close()
+
+
 def add_group_member(group_id: int, username: str):
     conn = get_db()
     conn.execute(
@@ -311,13 +335,16 @@ def add_group_member(group_id: int, username: str):
 def get_user_groups(username: str):
     conn = get_db()
     rows = conn.execute(
-        """SELECT g.id, g.name FROM groups g
+        """SELECT g.id, g.name, g.created_by FROM groups g
            JOIN group_members gm ON gm.group_id = g.id
            WHERE gm.username = ?""",
         (username,),
     ).fetchall()
     conn.close()
-    return [{"id": r["id"], "name": r["name"], "members": get_group_members(r["id"])} for r in rows]
+    return [
+        {"id": r["id"], "name": r["name"], "members": get_group_members(r["id"]), "created_by": r["created_by"]}
+        for r in rows
+    ]
 
 
 def save_group_message(sender, group_id, msg_type, content, file_url=None):
@@ -379,6 +406,44 @@ def get_all_users():
     return {r["username"]: r["avatar_url"] for r in rows}
 
 
+def hide_contact(username: str, hidden_username: str):
+    conn = get_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO hidden_contacts (username, hidden_username) VALUES (?,?)",
+        (username, hidden_username),
+    )
+    conn.commit()
+    conn.close()
+
+
+def unhide_contact(username: str, hidden_username: str):
+    conn = get_db()
+    conn.execute(
+        "DELETE FROM hidden_contacts WHERE username=? AND hidden_username=?",
+        (username, hidden_username),
+    )
+    conn.commit()
+    conn.close()
+
+
+def is_contact_hidden(username: str, other: str) -> bool:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT 1 FROM hidden_contacts WHERE username=? AND hidden_username=?", (username, other)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def get_hidden_contacts(username: str):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT hidden_username FROM hidden_contacts WHERE username=?", (username,)
+    ).fetchall()
+    conn.close()
+    return {r["hidden_username"] for r in rows}
+
+
 def set_avatar(username: str, avatar_url: str):
     conn = get_db()
     conn.execute("UPDATE users SET avatar_url=? WHERE username=?", (avatar_url, username))
@@ -426,8 +491,9 @@ class ConnectionManager:
         for ws in list(self.active.values()):
             await ws.send_json(payload)
 
-    def roster(self):
+    def roster(self, viewer: str = None):
         users = get_all_users()
+        hidden = get_hidden_contacts(viewer) if viewer else set()
         return [
             {
                 "username": u,
@@ -435,10 +501,24 @@ class ConnectionManager:
                 "avatar_url": avatar_url,
             }
             for u, avatar_url in sorted(users.items())
+            if u not in hidden
         ]
 
 
 manager = ConnectionManager()
+
+
+async def refresh_contact_view(username: str):
+    await manager.send_to(username, {"type": "roster", "users": manager.roster(username)})
+    await manager.send_to(username, {"type": "hidden_contacts", "hidden": sorted(get_hidden_contacts(username))})
+
+
+async def unhide_if_needed(recipient: str, sender: str):
+    """Si 'recipient' había borrado a 'sender' de su lista y ahora le llega un mensaje suyo,
+    reaparece automáticamente (igual que en WhatsApp)."""
+    if is_contact_hidden(recipient, sender):
+        unhide_contact(recipient, sender)
+        await refresh_contact_view(recipient)
 
 
 # ---------- Rutas HTTP ----------
@@ -528,6 +608,24 @@ async def delete_conversation_endpoint(payload: DeleteConversation):
     return {"ok": True}
 
 
+class DeleteContact(BaseModel):
+    token: str
+    username: str
+
+
+@app.post("/api/contacts/delete")
+async def delete_contact_endpoint(payload: DeleteContact):
+    requester = sessions.get(payload.token)
+    if requester is None:
+        raise HTTPException(401, "Sesión inválida, volvé a iniciar sesión")
+    if payload.username == requester:
+        raise HTTPException(400, "No podés borrarte a vos mismo")
+
+    hide_contact(requester, payload.username)
+    await refresh_contact_view(requester)
+    return {"ok": True}
+
+
 class CreateGroup(BaseModel):
     token: str
     name: str
@@ -600,6 +698,31 @@ async def delete_group_history_endpoint(payload: DeleteGroupHistory):
     return {"ok": True}
 
 
+class DeleteGroup(BaseModel):
+    token: str
+    group_id: int
+
+
+@app.post("/api/groups/delete")
+async def delete_group_endpoint(payload: DeleteGroup):
+    username = sessions.get(payload.token)
+    if username is None:
+        raise HTTPException(401, "Sesión inválida, volvé a iniciar sesión")
+
+    creator = get_group_creator(payload.group_id)
+    if creator is None:
+        raise HTTPException(404, "Ese grupo no existe")
+    if creator != username:
+        raise HTTPException(403, "Solo quien creó el grupo puede eliminarlo")
+
+    members = get_group_members(payload.group_id)
+    delete_group(payload.group_id)
+
+    for member in members:
+        await manager.send_to(member, {"type": "group_deleted", "group_id": payload.group_id})
+    return {"ok": True}
+
+
 @app.post("/upload")
 async def upload(
     file: UploadFile,
@@ -644,6 +767,8 @@ async def upload(
         for member in get_group_members(group_id):
             await manager.send_to(member, payload)
     else:
+        if recipient != sender:
+            await unhide_if_needed(recipient, sender)
         initial_status = "delivered" if manager.is_online(recipient) else "sent"
         message = save_message(sender, recipient, msg_type, file.filename, file_url, status=initial_status)
         payload = {"type": "message", "message": message}
@@ -675,8 +800,9 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
 
     manager.register(username, websocket)
     await manager.broadcast({"type": "presence", "username": username, "status": "online"})
-    await websocket.send_json({"type": "roster", "users": manager.roster()})
+    await websocket.send_json({"type": "roster", "users": manager.roster(username)})
     await websocket.send_json({"type": "groups", "groups": get_user_groups(username)})
+    await websocket.send_json({"type": "hidden_contacts", "hidden": sorted(get_hidden_contacts(username))})
 
     # Los mensajes que le mandaron mientras estaba desconectado ahora se marcan "entregado"
     senders_to_notify = mark_delivered_on_connect(username)
@@ -712,6 +838,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                         continue
                     if len(text) > 5000:
                         text = text[:5000]
+                    if to != username:
+                        await unhide_if_needed(to, username)
                     initial_status = "delivered" if manager.is_online(to) else "sent"
                     message = save_message(username, to, "text", text, status=initial_status)
                     payload = {"type": "message", "message": message}
@@ -727,7 +855,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                             await manager.send_to(other, {"type": "read_receipt", "by": username})
 
                 elif action == "roster_request":
-                    await websocket.send_json({"type": "roster", "users": manager.roster()})
+                    await websocket.send_json({"type": "roster", "users": manager.roster(username)})
 
                 elif action == "open_group":
                     group_id = data.get("group_id")
